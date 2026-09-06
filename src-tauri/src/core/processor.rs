@@ -3,12 +3,17 @@
 //! 扫描 → 恢复 → 哈希 → 确认重复 → 生成计划 → 回收站 → 重命名计划 →
 //! 临时重命名 → 最终重命名 → 报告。先建完整计划,再执行;
 //! 任何单文件失败不影响整体,任何致命失败保证目录一致。
+//!
+//! 可配置项(需求:v0.2.0 功能可配置化):
+//! - `hash_algorithm`:MD5(默认)/ SHA-256 / XXH3
+//! - `dry_run`:预览模式——除内部 `.hashrename` 检查外**零写入**,
+//!   连目录锁与恢复都不执行,输出完整执行计划。
 
 use crate::core::duplicate_detector;
 use crate::core::error::{FileError, HrError};
-use crate::core::hasher::{compute_hashes, Hasher};
+use crate::core::hasher::{compute_hashes, HashAlgorithm};
 use crate::core::lock;
-use crate::core::models::ProcessingResult;
+use crate::core::models::{ProcessingResult, RenamePreview};
 use crate::core::progress::{Progress, Stage};
 use crate::core::rename_planner::{plan_renames, OccupiedNames, RenamePlan};
 use crate::core::renamer;
@@ -23,12 +28,18 @@ use std::time::Instant;
 pub struct ProcessOptions {
     /// 并行哈希线程数。
     pub hash_threads: usize,
+    /// 哈希算法(默认 MD5)。
+    pub hash_algorithm: HashAlgorithm,
+    /// 预览模式:只输出计划,不修改任何文件。
+    pub dry_run: bool,
 }
 
 impl Default for ProcessOptions {
     fn default() -> Self {
         ProcessOptions {
             hash_threads: crate::core::hasher::default_thread_count(),
+            hash_algorithm: HashAlgorithm::default(),
+            dry_run: false,
         }
     }
 }
@@ -39,25 +50,32 @@ pub fn process_directory(
     opts: &ProcessOptions,
     progress: &Progress,
     trash_provider: Arc<dyn TrashProvider>,
-    hasher: Arc<dyn Hasher>,
 ) -> Result<ProcessingResult, HrError> {
     let t0 = Instant::now();
-    let mut result = ProcessingResult::default();
+    let mut result = ProcessingResult {
+        hash_algorithm: opts.hash_algorithm.as_str().to_string(),
+        ..ProcessingResult::default()
+    };
 
     // 阶段 0:目录校验
-    let dir = dir
-        .canonicalize()
-        .map_err(|e| crate::core::error::HrError::Directory {
-            path: dir.display().to_string(),
-            source: e,
-        })?;
+    let dir = dir.canonicalize().map_err(|e| HrError::Directory {
+        path: dir.display().to_string(),
+        source: e,
+    })?;
     if !dir.is_dir() {
-        return Err(crate::core::error::HrError::Directory {
+        return Err(HrError::Directory {
             path: dir.display().to_string(),
             source: std::io::Error::other("不是目录"),
         });
     }
     result.directory = dir.display().to_string();
+
+    let algo_name = opts.hash_algorithm.as_str().to_uppercase();
+
+    // 预览模式:完全不写入(不取锁、不恢复),只做只读的分析与规划
+    if opts.dry_run {
+        return process_dry_run(dir, opts, progress, &mut result, &algo_name, t0);
+    }
 
     progress.stage(Stage::Recover, "正在检查未完成任务...");
     progress.tick_range(1.0, 0.0, 0.01);
@@ -98,10 +116,11 @@ pub fn process_directory(
     let to_hash = needed.iter().filter(|&&b| b).count();
     progress.stage(
         Stage::Hash,
-        format!("正在计算 MD5({to_hash} 个候选文件)..."),
+        format!("正在计算 {algo_name}({to_hash} 个候选文件)..."),
     );
 
-    // 阶段 3:并行流式 MD5
+    // 阶段 3:并行流式哈希(算法可配置)
+    let hasher = opts.hash_algorithm.create();
     let hashes = compute_hashes(&scan.files, &needed, hasher, opts.hash_threads, progress);
     progress.tick_range(1.0, 0.03, 0.63);
 
@@ -113,21 +132,17 @@ pub fn process_directory(
     // 哈希失败(文件消失/无权限等):记录错误,该文件不参与去重,保留原名
     let hash_values: Vec<Option<crate::core::models::HashValue>> = hashes
         .into_iter()
-        .enumerate()
-        .map(|(i, r)| match r {
+        .map(|r| match r {
             Some(Ok(h)) => Some(h),
             Some(Err(e)) => {
                 result.errors.push(e);
                 None
             }
-            None => {
-                let _ = i;
-                None
-            }
+            None => None,
         })
         .collect();
 
-    // 阶段 4:确认重复(大小 + MD5 + 逐字节二次验证)
+    // 阶段 4:确认重复(大小 + 哈希 + 逐字节二次验证)
     progress.stage(Stage::Verify, "正在验证重复文件...");
     let detection = duplicate_detector::detect_duplicates(&scan.files, &hash_values, progress);
     result.errors.extend(detection.errors);
@@ -252,13 +267,160 @@ pub fn process_directory(
 
     drop(dir_lock);
 
+    finish(result, progress, t0)
+}
+
+/// 预览(干跑)模式:只读分析 + 计划输出,不取锁、不恢复、不写任何文件。
+fn process_dry_run(
+    dir: std::path::PathBuf,
+    opts: &ProcessOptions,
+    progress: &Progress,
+    result: &mut ProcessingResult,
+    algo_name: &str,
+    t0: Instant,
+) -> Result<ProcessingResult, HrError> {
+    result.dry_run = true;
+    result.warnings.push("预览模式:未修改任何文件".to_string());
+
+    progress.stage(Stage::Scan, "正在扫描文件...");
+    let scan = scanner::scan_directory(&dir)?;
+    result.scanned_count = scan.files.len();
+    result.skipped_count = scan.skipped.len();
+    result.errors.extend(scan.errors);
+    progress.tick_range(1.0, 0.0, 0.1);
+
+    // 大小预筛选
+    let mut by_size: std::collections::BTreeMap<u64, Vec<usize>> = Default::default();
+    for (i, f) in scan.files.iter().enumerate() {
+        by_size.entry(f.size).or_default().push(i);
+    }
+    let needed: Vec<bool> = (0..scan.files.len())
+        .map(|i| {
+            by_size
+                .get(&scan.files[i].size)
+                .is_some_and(|v| v.len() > 1)
+        })
+        .collect();
+    let to_hash = needed.iter().filter(|&&b| b).count();
+    progress.stage(
+        Stage::Hash,
+        format!("正在计算 {algo_name}({to_hash} 个候选文件)..."),
+    );
+    let hasher = opts.hash_algorithm.create();
+    let hashes = compute_hashes(&scan.files, &needed, hasher, opts.hash_threads, progress);
+    progress.tick_range(1.0, 0.1, 0.6);
+
+    if progress.cancelled() {
+        return finish_cancelled_preview(result.clone(), progress, t0);
+    }
+
+    let hash_values: Vec<Option<crate::core::models::HashValue>> = hashes
+        .into_iter()
+        .map(|r| match r {
+            Some(Ok(h)) => Some(h),
+            Some(Err(e)) => {
+                result.errors.push(e);
+                None
+            }
+            None => None,
+        })
+        .collect();
+
+    progress.stage(Stage::Verify, "正在验证重复文件...");
+    let detection = duplicate_detector::detect_duplicates(&scan.files, &hash_values, progress);
+    result.errors.extend(detection.errors);
+    result.duplicate_groups = detection.groups.len();
+    result.duplicate_count = detection.groups.iter().map(|g| g.duplicates.len()).sum();
+    progress.tick_range(1.0, 0.6, 0.75);
+
+    // 预览输出:将被移入回收站的文件
+    result.planned_trashes = detection
+        .groups
+        .iter()
+        .flat_map(|g| g.duplicates.iter().map(|d| d.file_name.clone()))
+        .collect();
+
+    // 预览输出:剩余文件的完整重命名计划
+    result.kept_count = scan.files.len() - result.planned_trashes.len();
+    let remaining: Vec<crate::core::models::FileEntry> = {
+        let trash_set: HashSet<&str> = result.planned_trashes.iter().map(|s| s.as_str()).collect();
+        scan.files
+            .iter()
+            .filter(|f| !trash_set.contains(f.file_name.as_str()))
+            .cloned()
+            .collect()
+    };
+    progress.counts(
+        result.scanned_count,
+        result.duplicate_count,
+        result.kept_count,
+    );
+
+    progress.stage(Stage::Plan, "正在生成重命名计划...");
+    let mut occupied = OccupiedNames::new();
+    for s in &scan.skipped {
+        if let Some(name) = s.path.file_name() {
+            occupied.insert(&name.to_string_lossy());
+        }
+    }
+    let plan = plan_renames(
+        &remaining,
+        &occupied,
+        crate::platform::current_pid(),
+        "preview",
+    );
+    for b in &plan.blocked {
+        result.errors.push(FileError::new(
+            "rename",
+            &remaining[b.entry_index].path,
+            b.reason.clone(),
+        ));
+    }
+    result.planned_renames = plan
+        .ops
+        .iter()
+        .map(|op| RenamePreview {
+            from: op.original_name.clone(),
+            to: op.final_name.clone(),
+        })
+        .collect();
+    result.renamed_count = result.planned_renames.len();
+    progress.tick_range(1.0, 0.75, 1.0);
+
+    finish(result.clone(), progress, t0)
+}
+
+fn finish(
+    mut result: ProcessingResult,
+    progress: &Progress,
+    t0: Instant,
+) -> Result<ProcessingResult, HrError> {
     result.cancelled = progress.cancelled();
     result.failed_count = result.errors.len();
     result.elapsed_ms = t0.elapsed().as_millis() as u64;
-
-    progress.stage(Stage::Done, "处理完成");
+    let verb = if result.dry_run {
+        "预览完成"
+    } else {
+        "处理完成"
+    };
+    progress.stage(Stage::Done, verb);
     progress.emit(&crate::core::progress::ProgressEvent::Finished {
-        result: result.clone(),
+        result: Box::new(result.clone()),
+    });
+    Ok(result)
+}
+
+fn finish_cancelled_preview(
+    mut result: ProcessingResult,
+    progress: &Progress,
+    t0: Instant,
+) -> Result<ProcessingResult, HrError> {
+    result.cancelled = true;
+    result.failed_count = result.errors.len();
+    result.elapsed_ms = t0.elapsed().as_millis() as u64;
+    result.warnings.push("任务已取消".to_string());
+    progress.emit(&crate::core::progress::ProgressEvent::Finished {
+        result: Box::new(result.clone()),
     });
     Ok(result)
 }

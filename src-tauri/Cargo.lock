@@ -1240,7 +1240,7 @@ checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 
 [[package]]
 name = "hashrename"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "libc",
  "md-5",
@@ -1255,6 +1255,7 @@ dependencies = [
  "trash",
  "windows-sys 0.59.0",
  "winreg",
+ "xxhash-rust",
 ]
 
 [[package]]
@@ -4719,6 +4720,12 @@ dependencies = [
  "once_cell",
  "pkg-config",
 ]
+
+[[package]]
+name = "xxhash-rust"
+version = "0.8.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aee1b19627c7c60102ab80d3a9cbe18de90bfe03bfa6c3715447681f0e8c8af6"
 
 [[package]]
 name = "yoke"

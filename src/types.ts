@@ -10,6 +10,11 @@ export type Stage =
   | "rename"
   | "done";
 
+export interface RenamePreview {
+  from: string;
+  to: string;
+}
+
 export interface ProcessingResult {
   directory: string;
   scanned_count: number;
@@ -21,6 +26,10 @@ export interface ProcessingResult {
   renamed_count: number;
   failed_count: number;
   cancelled: boolean;
+  dry_run: boolean;
+  planned_trashes: string[];
+  planned_renames: RenamePreview[];
+  hash_algorithm: string;
   recovered_finals: number;
   restored_temps: number;
   orphan_temps: number;
@@ -46,4 +55,12 @@ export type ProgressEvent =
 export interface LaunchInfo {
   dir: string | null;
   version: string;
+}
+
+/** 与 Rust ProcessOptions 对应的处理选项(功能可配置)。 */
+export interface ProcessingOptions {
+  /** 哈希算法:md5 / sha256 / xxh3 */
+  hashAlgorithm: string;
+  /** 预览模式:只输出计划,不修改任何文件 */
+  dryRun: boolean;
 }

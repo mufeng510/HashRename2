@@ -1,8 +1,8 @@
 //! 端到端集成测试:通过 `process_directory` 完整走一遍九阶段流水线。
 
 use hashrename_lib::core::error::HrError;
-use hashrename_lib::core::hasher::Md5Hasher;
-use hashrename_lib::core::models::ProcessingResult;
+use hashrename_lib::core::hasher::HashAlgorithm;
+use hashrename_lib::core::models::{ProcessingResult, RenamePreview};
 use hashrename_lib::core::processor::{process_directory, ProcessOptions};
 use hashrename_lib::core::progress::Progress;
 use hashrename_lib::core::trash::{OsTrash, TrashProvider};
@@ -65,7 +65,6 @@ fn run_with(root: &Path, work_dir: &Path) -> ProcessingResult {
         &ProcessOptions::default(),
         &Progress::default(),
         trash,
-        Arc::new(Md5Hasher),
     )
     .expect("处理不应致命失败")
 }
@@ -302,7 +301,6 @@ fn duplicates_go_to_quarantine_not_permanently_deleted() {
         &ProcessOptions::default(),
         &Progress::default(),
         trash.clone(),
-        Arc::new(Md5Hasher),
     )
     .unwrap();
 
@@ -335,7 +333,6 @@ fn real_system_trash_receives_duplicates() {
         &ProcessOptions::default(),
         &Progress::default(),
         Arc::new(OsTrash),
-        Arc::new(Md5Hasher),
     )
     .unwrap();
 
@@ -398,7 +395,6 @@ fn trash_failure_stops_and_preserves_files() {
         &ProcessOptions::default(),
         &Progress::default(),
         Arc::new(FailingTrash),
-        Arc::new(Md5Hasher),
     )
     .unwrap();
 
@@ -432,7 +428,6 @@ fn second_concurrent_run_is_rejected() {
         &ProcessOptions::default(),
         &Progress::default(),
         trash,
-        Arc::new(Md5Hasher),
     )
     .unwrap_err();
     match err {
@@ -449,7 +444,6 @@ fn second_concurrent_run_is_rejected() {
         &ProcessOptions::default(),
         &Progress::default(),
         Arc::new(TestTrash::new(&root)),
-        Arc::new(Md5Hasher),
     )
     .unwrap();
     assert_eq!(res.renamed_count, 1);
@@ -549,7 +543,6 @@ fn nonexistent_dir_is_fatal_error() {
         &ProcessOptions::default(),
         &Progress::default(),
         Arc::new(OsTrash),
-        Arc::new(Md5Hasher),
     )
     .unwrap_err();
     assert!(matches!(err, HrError::Directory { .. }));
@@ -654,4 +647,179 @@ fn duplicate_groups_across_sizes_and_names() {
     assert_eq!(contents_of(&work, "001.bin"), vec![7u8; 4096]);
     assert_eq!(contents_of(&work, "002.jpg"), b"JPEGDATA");
     assert_eq!(contents_of(&work, "003.txt"), b"unique-content");
+}
+
+// ---------------- 可配置哈希算法(v0.2.0) ----------------
+
+fn run_with_algorithm(root: &Path, algo: HashAlgorithm) -> ProcessingResult {
+    let trash = Arc::new(TestTrash::new(root));
+    process_directory(
+        &root.join("work"),
+        &ProcessOptions {
+            hash_algorithm: algo,
+            ..ProcessOptions::default()
+        },
+        &Progress::default(),
+        trash,
+    )
+    .expect("处理不应致命失败")
+}
+
+#[test]
+fn sha256_algorithm_dedupes_end_to_end() {
+    let root = tmpdir("algo_sha");
+    let work = root.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    std::fs::write(work.join("one.jpg"), b"CONTENT-SHARED").unwrap();
+    std::fs::write(work.join("two.jpg"), b"CONTENT-SHARED").unwrap();
+    std::fs::write(work.join("diff.jpg"), b"CONTENT-OTHER!!").unwrap();
+
+    let res = run_with_algorithm(&root, HashAlgorithm::Sha256);
+    assert_eq!(res.hash_algorithm, "sha256");
+    assert_eq!(res.duplicate_count, 1);
+    assert_eq!(res.trashed_count, 1);
+    // 自然排序:diff.jpg 在 one.jpg 之前 → diff 保留为 001,one 为 002,two 进回收站
+    assert_eq!(names_of(&work), vec!["001.jpg", "002.jpg"]);
+    assert_eq!(contents_of(&work, "001.jpg"), b"CONTENT-OTHER!!");
+    assert_eq!(contents_of(&work, "002.jpg"), b"CONTENT-SHARED");
+}
+
+#[test]
+fn xxh3_algorithm_dedupes_end_to_end() {
+    let root = tmpdir("algo_xxh3");
+    let work = root.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    std::fs::write(work.join("a.bin"), vec![1u8; 4096]).unwrap();
+    std::fs::write(work.join("b.bin"), vec![1u8; 4096]).unwrap();
+    std::fs::write(work.join("c.bin"), vec![1u8; 4096]).unwrap();
+    std::fs::write(work.join("d.bin"), vec![2u8; 4096]).unwrap(); // 同大小不同内容
+
+    let res = run_with_algorithm(&root, HashAlgorithm::Xxh3);
+    assert_eq!(res.hash_algorithm, "xxh3");
+    assert_eq!(res.duplicate_count, 2);
+    assert_eq!(res.trashed_count, 2);
+    // a/b/c 同内容,保留 a;d 独立保留
+    assert_eq!(names_of(&work), vec!["001.bin", "002.bin"]);
+    assert_eq!(contents_of(&work, "001.bin"), vec![1u8; 4096]);
+    assert_eq!(contents_of(&work, "002.bin"), vec![2u8; 4096]);
+}
+
+// ---------------- 干跑预览模式(v0.2.0) ----------------
+
+#[test]
+fn dry_run_reports_plan_and_modifies_nothing() {
+    let root = tmpdir("dry");
+    let work = root.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    std::fs::write(work.join("IMG_10.jpg"), b"SAME").unwrap();
+    std::fs::write(work.join("IMG_1.jpg"), b"SAME").unwrap();
+    std::fs::write(work.join("solo.txt"), b"UNIQUE").unwrap();
+
+    let trash = Arc::new(TestTrash::new(&root));
+    let res = process_directory(
+        &work,
+        &ProcessOptions {
+            dry_run: true,
+            ..ProcessOptions::default()
+        },
+        &Progress::default(),
+        trash.clone(),
+    )
+    .unwrap();
+
+    assert!(res.dry_run);
+    assert_eq!(res.scanned_count, 3);
+    assert_eq!(res.duplicate_count, 1);
+    assert_eq!(res.trashed_count, 0, "预览模式不得执行回收站操作");
+    assert_eq!(res.renamed_count, 2, "预览计数 = 计划数");
+    // 计划:IMG_1.jpg 保留(自然序最前),IMG_10.jpg 进回收站
+    assert_eq!(res.planned_trashes, vec!["IMG_10.jpg"]);
+    assert_eq!(
+        res.planned_renames,
+        vec![
+            RenamePreview {
+                from: "IMG_1.jpg".into(),
+                to: "001.jpg".into()
+            },
+            RenamePreview {
+                from: "solo.txt".into(),
+                to: "002.txt".into()
+            },
+        ]
+    );
+
+    // 目录与文件完全未变:没有回收站隔离文件、没有内部文件、没有改名
+    assert!(trash.trashed.lock().unwrap().is_empty());
+    let all: Vec<String> = std::fs::read_dir(&work)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+        .collect();
+    assert_eq!(all.len(), 3, "目录中不得新增任何文件(包括内部文件)");
+    assert!(work.join("IMG_1.jpg").exists());
+    assert!(work.join("IMG_10.jpg").exists());
+    assert!(work.join("solo.txt").exists());
+}
+
+#[test]
+fn dry_run_reports_conflicts_like_real_run() {
+    let root = tmpdir("dry_conflict");
+    let work = root.join("work");
+    std::fs::create_dir_all(work.join("001.jpg")).unwrap(); // 子目录占 1 号位
+    std::fs::write(work.join("photo.jpg"), b"P").unwrap();
+
+    let res = process_directory(
+        &work,
+        &ProcessOptions {
+            dry_run: true,
+            ..ProcessOptions::default()
+        },
+        &Progress::default(),
+        Arc::new(TestTrash::new(&root)),
+    )
+    .unwrap();
+    assert!(res.dry_run);
+    assert!(
+        res.errors.iter().any(|e| e.operation == "rename"),
+        "预览应报告同样的冲突: {:?}",
+        res.errors
+    );
+    assert!(work.join("photo.jpg").exists());
+    assert!(work.join("001.jpg").is_dir());
+}
+
+#[test]
+fn dry_run_finds_dups_with_each_algorithm() {
+    for algo in [
+        HashAlgorithm::Md5,
+        HashAlgorithm::Sha256,
+        HashAlgorithm::Xxh3,
+    ] {
+        let root = tmpdir("dry_algo");
+        let work = root.join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::write(work.join("x.dat"), b"DATA").unwrap();
+        std::fs::write(work.join("y.dat"), b"DATA").unwrap();
+        let trash = Arc::new(TestTrash::new(&root));
+        let res = process_directory(
+            &work,
+            &ProcessOptions {
+                hash_algorithm: algo,
+                dry_run: true,
+                ..ProcessOptions::default()
+            },
+            &Progress::default(),
+            trash,
+        )
+        .unwrap();
+        assert!(res.dry_run);
+        assert_eq!(res.hash_algorithm, algo.as_str());
+        assert_eq!(
+            res.duplicate_count,
+            1,
+            "算法 {} 应检出 1 个重复",
+            algo.as_str()
+        );
+        assert_eq!(res.planned_trashes, vec!["y.dat"]);
+        assert!(work.join("x.dat").exists() && work.join("y.dat").exists());
+    }
 }

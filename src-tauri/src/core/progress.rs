@@ -42,7 +42,7 @@ pub enum ProgressEvent {
         message: String,
     },
     Finished {
-        result: ProcessingResult,
+        result: Box<ProcessingResult>,
     },
 }
 

@@ -64,6 +64,14 @@ pub struct ProcessingResult {
     /// 失败的文件操作数。
     pub failed_count: usize,
     pub cancelled: bool,
+    /// 预览模式(干跑):不修改任何文件,只输出计划。
+    pub dry_run: bool,
+    /// 预览:将被移入回收站的文件名。
+    pub planned_trashes: Vec<String>,
+    /// 预览:将执行的重命名(原名 → 新名)。
+    pub planned_renames: Vec<RenamePreview>,
+    /// 实际使用的哈希算法。
+    pub hash_algorithm: String,
     /// 异常恢复:补完的最终重命名数。
     pub recovered_finals: usize,
     /// 异常恢复:还原的临时文件数。
@@ -73,6 +81,13 @@ pub struct ProcessingResult {
     pub elapsed_ms: u64,
     pub errors: Vec<crate::core::error::FileError>,
     pub warnings: Vec<String>,
+}
+
+/// 预览模式输出的一条重命名计划。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RenamePreview {
+    pub from: String,
+    pub to: String,
 }
 
 impl ProcessingResult {

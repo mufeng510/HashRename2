@@ -1,6 +1,9 @@
 //! Hasher 抽象(需求 §39)与并行计算。
 //!
-//! 第一版默认 MD5;架构上允许未来替换为 SHA-256 等(见 `Sha256Hasher`)。
+//! 支持的算法(可配置,默认 MD5):
+//! - `md5`(RFC 1321,128 位)
+//! - `sha256`(160 位安全性更高的密码学哈希,256 位)
+//! - `xxh3`(XXH3-64,非加密但极快;碰撞防护由逐字节二次验证兜底)
 
 use crate::core::error::{FileError, HrError};
 use crate::core::models::{FileEntry, HashValue};
@@ -10,6 +13,53 @@ use std::path::Path;
 use std::sync::Arc;
 /// 每次读取的缓冲区大小(流式哈希,不把整个文件读入内存)。
 pub const HASH_BUFFER_SIZE: usize = 256 * 1024;
+
+/// 可配置的哈希算法。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HashAlgorithm {
+    /// MD5(默认,需求第一版指定)。
+    #[default]
+    Md5,
+    Sha256,
+    Xxh3,
+}
+
+impl HashAlgorithm {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            HashAlgorithm::Md5 => "md5",
+            HashAlgorithm::Sha256 => "sha256",
+            HashAlgorithm::Xxh3 => "xxh3",
+        }
+    }
+
+    /// 解析用户输入;无法识别时返回 None(调用方报错,不静默回退)。
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "md5" => Some(HashAlgorithm::Md5),
+            "sha256" | "sha-256" => Some(HashAlgorithm::Sha256),
+            "xxh3" | "xxhash" | "xxhash3" => Some(HashAlgorithm::Xxh3),
+            _ => None,
+        }
+    }
+
+    /// 全部算法(供 GUI 下拉框与帮助文本)。
+    pub fn all() -> &'static [HashAlgorithm] {
+        &[
+            HashAlgorithm::Md5,
+            HashAlgorithm::Sha256,
+            HashAlgorithm::Xxh3,
+        ]
+    }
+
+    pub fn create(self) -> Arc<dyn Hasher> {
+        match self {
+            HashAlgorithm::Md5 => Arc::new(Md5Hasher),
+            HashAlgorithm::Sha256 => Arc::new(Sha256Hasher),
+            HashAlgorithm::Xxh3 => Arc::new(Xxh3Hasher),
+        }
+    }
+}
 
 /// 哈希算法抽象。实现必须流式读取,不得将整个文件载入内存。
 pub trait Hasher: Send + Sync {
@@ -28,7 +78,7 @@ pub trait Hasher: Send + Sync {
     }
 }
 
-/// MD5(第一版默认算法)。
+/// MD5(默认算法)。
 pub struct Md5Hasher;
 
 impl Hasher for Md5Hasher {
@@ -51,7 +101,7 @@ impl Hasher for Md5Hasher {
     }
 }
 
-/// SHA-256(证明 Hasher 抽象可扩展,第一版未在业务中启用)。
+/// SHA-256(密码学哈希,适合对碰撞敏感的场景)。
 pub struct Sha256Hasher;
 
 impl Hasher for Sha256Hasher {
@@ -71,6 +121,29 @@ impl Hasher for Sha256Hasher {
             hasher.update(&buf[..n]);
         }
         Ok(HashValue(hasher.finalize().to_vec()))
+    }
+}
+
+/// XXH3-64(非加密、极快;理论碰撞率高于 MD5,由逐字节二次验证兜底,
+/// 见需求 §9 —— 安全性不受算法选择影响)。
+pub struct Xxh3Hasher;
+
+impl Hasher for Xxh3Hasher {
+    fn algorithm(&self) -> &'static str {
+        "xxh3"
+    }
+
+    fn hash_reader(&self, r: &mut dyn Read) -> std::io::Result<HashValue> {
+        let mut hasher = xxhash_rust::xxh3::Xxh3::new();
+        let mut buf = vec![0u8; HASH_BUFFER_SIZE];
+        loop {
+            let n = r.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+        }
+        Ok(HashValue(hasher.digest().to_le_bytes().to_vec()))
     }
 }
 
@@ -216,5 +289,52 @@ mod tests {
         let mut m = md5::Md5::new();
         m.update(&data);
         assert_eq!(v1.hex(), hex_of(&m.finalize()));
+    }
+
+    #[test]
+    fn xxh3_deterministic_and_size_differentiating() {
+        let h = Xxh3Hasher;
+        let dir = std::env::temp_dir().join(format!("hr_hash3_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pa = dir.join("a.bin");
+        let pb = dir.join("b.bin");
+        std::fs::write(&pa, b"payload-1").unwrap();
+        std::fs::write(&pb, b"payload-2").unwrap();
+        let va = h.hash_file(&pa).unwrap();
+        assert_eq!(va.0.len(), 8, "XXH3-64 摘要为 8 字节");
+        // 确定性:同一内容重复哈希结果一致
+        assert_eq!(h.hash_file(&pa).unwrap(), va);
+        // 区分不同内容
+        assert_ne!(h.hash_file(&pb).unwrap(), va);
+        // 大文件(跨缓冲区块)确定性
+        let pc = dir.join("big.bin");
+        let data = vec![0x5Au8; 3 * HASH_BUFFER_SIZE + 17];
+        std::fs::write(&pc, &data).unwrap();
+        let v1 = h.hash_file(&pc).unwrap();
+        let mut r: &[u8] = &data;
+        assert_eq!(h.hash_reader(&mut r).unwrap(), v1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn algorithm_parse_and_create() {
+        // 解析:大小写不敏感,别名宽容,未知值必须报错而非静默回退
+        assert_eq!(HashAlgorithm::parse("md5"), Some(HashAlgorithm::Md5));
+        assert_eq!(HashAlgorithm::parse("MD5"), Some(HashAlgorithm::Md5));
+        assert_eq!(HashAlgorithm::parse("sha256"), Some(HashAlgorithm::Sha256));
+        assert_eq!(HashAlgorithm::parse("SHA-256"), Some(HashAlgorithm::Sha256));
+        assert_eq!(HashAlgorithm::parse(" xxh3 "), Some(HashAlgorithm::Xxh3));
+        assert_eq!(HashAlgorithm::parse("xxhash3"), Some(HashAlgorithm::Xxh3));
+        assert_eq!(HashAlgorithm::parse("sha1"), None);
+        assert_eq!(HashAlgorithm::parse(""), None);
+        assert_eq!(HashAlgorithm::parse("md5x"), None);
+        // 默认算法是 MD5(需求第一版指定)
+        assert_eq!(HashAlgorithm::default(), HashAlgorithm::Md5);
+        // all() 供 GUI 下拉框
+        assert_eq!(HashAlgorithm::all().len(), 3);
+        // 工厂方法产出对应算法
+        assert_eq!(HashAlgorithm::Xxh3.create().algorithm(), "xxh3");
+        assert_eq!(HashAlgorithm::Sha256.create().algorithm(), "sha256");
+        assert_eq!(HashAlgorithm::Md5.create().algorithm(), "md5");
     }
 }

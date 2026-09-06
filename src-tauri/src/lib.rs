@@ -22,8 +22,10 @@ pub fn entrypoint() {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     let mut verbose = false;
-    let mut cli_dir: Option<PathBuf> = None;
-    let mut gui_dir: Option<PathBuf> = None;
+    let mut dry_run = false;
+    let mut cli_mode = false;
+    let mut gui_mode = false;
+    let mut hash_algorithm = crate::core::hasher::HashAlgorithm::default();
     let mut positional: Option<PathBuf> = None;
     let mut install_menu = false;
     let mut uninstall_menu = false;
@@ -40,14 +42,25 @@ pub fn entrypoint() {
                 return;
             }
             "--verbose" => verbose = true,
+            "--dry-run" => dry_run = true,
             "--install-context-menu" => install_menu = true,
             "--uninstall-context-menu" => uninstall_menu = true,
-            "--cli" => {
-                cli_dir = iter.next().map(PathBuf::from);
-            }
-            "--gui" => {
-                gui_dir = iter.next().map(PathBuf::from);
-            }
+            // 布尔标志:目录一律来自位置参数,避免吞掉后续标志
+            "--cli" => cli_mode = true,
+            "--gui" => gui_mode = true,
+            "--hash" => match iter.next() {
+                Some(v) => match crate::core::hasher::HashAlgorithm::parse(v) {
+                    Some(a) => hash_algorithm = a,
+                    None => {
+                        eprintln!("未知哈希算法: {v}(可选:md5 / sha256 / xxh3)");
+                        std::process::exit(2);
+                    }
+                },
+                None => {
+                    eprintln!("--hash 需要一个算法参数(md5 / sha256 / xxh3)");
+                    std::process::exit(2);
+                }
+            },
             other if other.starts_with('-') => {
                 eprintln!("未知参数: {other}");
                 eprintln!("使用 --help 查看用法。");
@@ -69,25 +82,42 @@ pub fn entrypoint() {
         return;
     }
 
-    match (cli_dir, gui_dir, positional) {
-        // 显式 --cli:无条件 CLI
-        (Some(dir), _, _) => {
-            let code = cli::run_cli(dir, verbose);
-            std::process::exit(code);
+    let cli_opts = crate::core::processor::ProcessOptions {
+        dry_run,
+        hash_algorithm,
+        ..crate::core::processor::ProcessOptions::default()
+    };
+
+    if cli_mode {
+        // --cli:强制命令行模式,目录必须给出
+        match positional {
+            Some(dir) => {
+                let code = cli::run_cli(dir, verbose, cli_opts);
+                std::process::exit(code);
+            }
+            None => {
+                eprintln!("--cli 需要一个目录参数,例如:hashrename --cli /path/to/dir");
+                std::process::exit(2);
+            }
         }
-        // 显式 --gui
-        (_, Some(dir), _) => run_gui(Some(dir)),
+    }
+    if gui_mode {
+        // --gui:强制图形窗口(目录可选)
+        run_gui(positional);
+        return;
+    }
+    match positional {
         // 目录参数:TTY → CLI;非 TTY(文件管理器右键启动)→ GUI
-        (_, _, Some(dir)) => {
+        Some(dir) => {
             let interactive = std::io::stdout().is_terminal();
             if interactive {
-                let code = cli::run_cli(dir, verbose);
+                let code = cli::run_cli(dir, verbose, cli_opts);
                 std::process::exit(code);
             } else {
                 run_gui(Some(dir));
             }
         }
-        (_, _, None) => run_gui(None),
+        None => run_gui(None),
     }
 }
 

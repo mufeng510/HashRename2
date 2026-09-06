@@ -42,6 +42,7 @@
 - **序号重命名**:剩余文件按原始文件名自然排序,统一重命名为 `001`、`002`……
 - **不递归**:只处理右键的那个文件夹本身,子目录一律不动
 - **零确认直接执行**:右键后立即开始,实时显示进度,完成后显示统计与错误
+- **可配置**(v0.2.0):哈希算法(MD5 / SHA-256 / xxHash3)、预览模式,CLI 与 GUI 均可设置
 - **防冲突**:两阶段重命名 + 目标名冲突检测,绝不覆盖已有文件
 - **防并发**:同一目录同时只允许一个任务(目录锁)
 - **可恢复**:任意时刻崩溃/被杀,下次运行自动恢复中断的重命名
@@ -118,6 +119,12 @@ Linux 各文件管理器的集成方式(由同一条 `--install-context-menu` �
 | 文件管理器 | 机制 | 位置 |
 | --- | --- | --- |
 | Nautilus(GNOME) | 用户脚本 | `~/.local/share/nautilus/scripts/` → 右键 → Scripts |
+
+> **关于 Nautilus 扩展机制的选择**(v0.2.0 调研结论):Nautilus 43 起已废弃进程内的
+> `MenuProvider` C/Python 扩展 API;社区转向的 DBus 外置扩展(如
+> actions-for-nautilus)**尚无稳定公开的注册接口**,且需要额外的 Python 服务进程。
+> 基于稳定性和零依赖原则,HashRename 对 Nautilus 采用官方长期支持的 Scripts 机制
+> (菜单位于右键 → Scripts 子菜单),待 GNOME 发布正式的 DBus 扩展规范后再跟进。
 | Dolphin(KDE Plasma 5/6) | 服务菜单 | `~/.local/share/kio/servicemenus/` |
 | Nemo(Cinnamon) | 动作 | `~/.local/share/nemo/actions/` |
 | Thunar(XFCE) | 自定义动作 | `~/.config/Thunar/uca.xml`(合并写入) |
@@ -141,14 +148,32 @@ hashrename --gui "/path/to/folder"       # 打开图形窗口处理
 hashrename                               # 打开图形窗口(选择文件夹)
 hashrename --install-context-menu        # 安装右键菜单
 hashrename --uninstall-context-menu      # 卸载右键菜单
-hashrename --verbose "/path/to/folder"   # 详细输出(逐文件进度)
 hashrename --help
 hashrename --version
 ```
 
+### 可配置选项(v0.2.0)
+
+CLI 与 GUI 中均可配置以下功能项:
+
+```bash
+hashrename --hash sha256 "/path/to/folder"  # 指定哈希算法:md5(默认)/ sha256 / xxh3
+hashrename --dry-run --cli "/path/to/folder"  # 预览模式:只输出计划,不修改任何文件
+hashrename --verbose "/path/to/folder"   # 详细输出(逐文件进度)
+```
+
+- **`--hash <算法>`**:去重所用的内容哈希算法。
+  - `md5`(默认):128 位,RFC 1321;
+  - `sha256`:256 位,密码学安全,适合对碰撞风险零容忍的场景;
+  - `xxh3`:XXH3-64,非加密、极快,适合大文件海量场景(理论碰撞率高于 MD5,安全性由逐字节二次验证兜底,误删风险与算法选择无关)。
+- **`--dry-run`**(预览模式):完整执行扫描/哈希/验证/规划四个只读阶段,打印「将移入回收站」与「将重命名」的完整清单,**不取目录锁、不恢复历史任务、不写入任何文件**(包括内部文件)。
+- **`--verbose`**:逐文件进度与调试信息。
+
+GUI 中对应「选择文件夹」页面的 **哈希算法下拉框** 与 **预览模式复选框**;右键菜单启动时使用窗口内上次选择的配置执行。
+
 模式判定:带目录参数且标准输出是终端 → CLI;从文件管理器/双击启动(无终端)→ 图形窗口。脚本中请显式使用 `--cli`。
 
-退出码:`0` 成功;`1` 完成但有失败或被取消;`2` 致命错误(目录不存在、被锁等)。
+退出码:`0` 成功;`1` 完成但有失败或被取消;`2` 致命错误(目录不存在、被锁、未知算法等)。
 
 ## 工作原理
 
@@ -172,9 +197,10 @@ hashrename --version
 ### MD5 去重规则
 
 - **判定依据只有文件内容**,与文件名、路径、扩展名无关:`a.jpg`、`b.png`、`c.webp` 内容相同即为重复。
-- 三重确认:文件大小相同 → MD5 相同 → **逐字节内容完全一致**。即使发生理论上的 MD5 碰撞,内容不同的文件也绝不会被误删。
+- 三重确认:文件大小相同 → 哈希相同 → **逐字节内容完全一致**。即使发生理论上的哈希碰撞,内容不同的文件也绝不会被误删。
+- **哈希算法可配置**(v0.2.0):`md5`(默认)/ `sha256` / `xxh3`,见 [可配置选项](#可配置选项v020)。无论选择哪种算法,逐字节二次验证都保证相同的安全底线。
 - 无法读取/验证的文件(权限、被占用等)一律**保留**,只记录错误。
-- 第一版仅内置 MD5;`Hasher` trait 已抽象,可扩展 SHA-256 等算法(代码内已附带 Sha256Hasher 实现与测试)。
+- `Hasher` trait 完全抽象,未来可继续扩展 SHA-1、BLAKE3 等算法。
 
 ### 文件保留规则
 
@@ -227,13 +253,13 @@ npm run tauri dev    # 启动开发模式(热重载)
 
 ```bash
 npm run build          # 前端类型检查 + 构建(GUI 资源在编译期嵌入,先于 cargo)
-cargo test             # 全部测试:48 个单元测试 + 21 个集成测试
+cargo test             # 全部测试:50 个单元测试 + 26 个集成测试
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all -- --check
 node scripts/check-version.mjs   # 版本号一致性检查
 ```
 
-测试覆盖(对应需求 §31):MD5 已知向量(空文件/abc/大文件流式/二进制)、去重(同内容异扩展名、同大小异内容、哈希碰撞模拟与二次验证防护)、自然排序(数字/中文/emoji/空格/大数防溢出)、编号位数(1/9/10/99/100/999/1000/10000)、扩展名(大小写/无扩展名/多段)、冲突(预存在 001.jpg、名为 001.jpg 的子目录)、回收站(真实系统回收站 + 失败安全停止)、权限(chmod 000,root 自动跳过)、并发(目录锁拒绝第二实例)、崩溃恢复(journal 补完/还原)。
+测试覆盖(对应需求 §31):MD5 已知向量(空文件/abc/大文件流式/二进制)、去重(同内容异扩展名、同大小异内容、哈希碰撞模拟与二次验证防护)、自然排序(数字/中文/emoji/空格/大数防溢出)、编号位数(1/9/10/99/100/999/1000/10000)、扩展名(大小写/无扩展名/多段)、冲突(预存在 001.jpg、名为 001.jpg 的子目录)、回收站(真实系统回收站 + 失败安全停止)、权限(chmod 000,root 自动跳过)、并发(目录锁拒绝第二实例)、崩溃恢复(journal 补完/还原)、可配置算法(MD5/SHA-256/xxH3 端到端)、预览模式(零修改断言、计划输出、冲突报告)。
 
 ## 构建
 
@@ -285,14 +311,15 @@ npm run tauri build -- --target universal-apple-darwin   # macOS 通用二进制
 ## 已知限制
 
 1. **Windows 回收站策略**:如果用户/组策略关闭了某分区的回收站("不将文件移入回收站"),系统 API 的行为由 OS 决定,程序无法绕过。
-2. **Windows 极长路径**:核心文件操作基于 Rust 标准库(内部使用 `\\?\` 完整路径),通常无 260 限制;但 Explorer 右键菜单的 `%V` 参数本身可能受 Explorer 长路径策略影响。
+2. **Windows 极长路径**:核心文件操作基于 Rust 标准库(内部使用 `\\?\` 完整路径),通常无 260 限制;但 Explorer 右键菜单的 `%V` 参数本身可能受 Explorer 长路径策略影响。回收站 API(IFileOperation)对超过 260 字符路径的支持由 Windows Shell 决定,未在实体 Windows 上验证。
 3. **Linux 大小写敏感性**按 `cfg!(target_os = "linux")` 判定,极少数大小写不敏感文件系统(如某些 FAT/NTFS 挂载)下的冲突检测可能多报或少报;最终重命名始终使用 `renameat2(RENAME_NOREPLACE)` 兜底,绝不会覆盖文件。内核不支持 `renameat2`(Linux < 3.15)时回退到「先检查后改名」,存在理论上的竞态窗口。
 4. **macOS Quick Action 为生成式安装**:由 `--install-context-menu` 写入 `~/Library/Services/HashRename.workflow`(Automator Run Shell Script 格式)。该机制是 macOS 10.14+ 的主流方案,但未经实体 macOS 设备实测;若快速操作未出现,可按 README「macOS 安装」一节在 Automator 中手动创建等效 Quick Action(`Run Shell Script`,输入作为参数,调用 `.../MacOS/hashrename --gui "$@"`)。
-5. **Linux 集成覆盖范围**:Nautilus/Dolphin/Nemo/Thunar 四种主流文件管理器;其他文件管理器(PCManFM-Qt 等)不在第一版范围,可直接用 CLI。
+5. **Linux 集成覆盖范围**:Nautilus/Dolphin/Nemo/Thunar 四种主流文件管理器;其他文件管理器(PCManFM-Qt 等)不在支持范围,可直接用 CLI。Nautilus 的 DBus 原生扩展接口尚未稳定(见「Linux 集成」一节的调研结论)。
 6. **多段扩展名**按标准语义取最后一段:`archive.tar.gz` 重命名为 `001.gz`。
 7. **隐藏文件参与处理**(除 `.hashrename` 内部文件外):`.gitignore` 等点开头的普通文件同样会被去重/重命名。
 8. **运行期间目录变化**:只处理启动扫描时的快照;运行中新增的文件不会被处理(避免无限重扫)。
 9. **未在实体设备上验证的平台**:Windows 与 macOS 仅通过 CI 构建产物验证打包流程,核心逻辑由跨平台测试覆盖;Linux 为开发实测平台。
+10. **预览模式的局限**:干跑结果基于扫描快照,真实执行前目录若被其他程序改动,实际计划可能与预览存在差异。
 
 ---
 

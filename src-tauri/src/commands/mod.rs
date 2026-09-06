@@ -1,6 +1,5 @@
 //! Tauri 命令层:GUI 与核心业务逻辑的桥(需求 §25)。
 
-use crate::core::hasher::Md5Hasher;
 use crate::core::models::ProcessingResult;
 use crate::core::processor::{process_directory, ProcessOptions};
 use crate::core::progress::{Progress, ProgressEvent};
@@ -49,6 +48,10 @@ pub fn start_processing(
     dir: String,
     on_event: Channel<ProgressEvent>,
     state: State<'_, AppState>,
+    // 可配置哈希算法:md5 / sha256 / xxh3(缺省 md5)
+    hash_algorithm: Option<String>,
+    // 预览模式:只输出计划,不修改任何文件
+    dry_run: Option<bool>,
 ) -> Result<(), String> {
     {
         let mut busy = state.busy.lock().unwrap();
@@ -57,6 +60,18 @@ pub fn start_processing(
         }
         *busy = true;
     }
+
+    // 前端传来的算法字符串在这里解析;无法识别直接报错,不静默回退
+    let hash_algorithm = match hash_algorithm.as_deref() {
+        None => crate::core::hasher::HashAlgorithm::default(),
+        Some(s) => crate::core::hasher::HashAlgorithm::parse(s)
+            .ok_or_else(|| format!("未知哈希算法: {s}(可选:md5 / sha256 / xxh3)"))?,
+    };
+    let opts = ProcessOptions {
+        hash_algorithm,
+        dry_run: dry_run.unwrap_or(false),
+        ..ProcessOptions::default()
+    };
 
     let path = PathBuf::from(&dir);
     let cancel = state.cancel.clone();
@@ -74,14 +89,7 @@ pub fn start_processing(
         );
         let reporter = handle.reporter();
 
-        let opts = ProcessOptions::default();
-        let result = process_directory(
-            &path,
-            &opts,
-            &reporter,
-            Arc::new(OsTrash),
-            Arc::new(Md5Hasher),
-        );
+        let result = process_directory(&path, &opts, &reporter, Arc::new(OsTrash));
 
         let res: ProcessingResult = match result {
             Ok(r) => r,
@@ -99,7 +107,9 @@ pub fn start_processing(
                 }
             }
         };
-        let _ = on_event.send(ProgressEvent::Finished { result: res });
+        let _ = on_event.send(ProgressEvent::Finished {
+            result: Box::new(res),
+        });
 
         // 任务结束:复位状态
         cancel.store(false, Ordering::SeqCst);
