@@ -39,6 +39,7 @@ jobs:
         if: matrix.target != 'universal-apple-darwin'
       - uses: Swatinem/rust-cache@v2
         with:
+          workspaces: src-tauri
           key: release-${{ matrix.target }}
       - uses: actions/setup-node@v4
         with:

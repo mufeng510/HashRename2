@@ -32,6 +32,8 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -40,10 +42,13 @@ jobs:
       - run: npm run build
       - name: rustfmt
         run: cargo fmt --all -- --check
+        working-directory: src-tauri
       - name: clippy
         run: cargo clippy --all-targets -- -D warnings
+        working-directory: src-tauri
       - name: 测试(单元 + 集成)
         run: cargo test --all
+        working-directory: src-tauri
 
   build:
     needs: [version-check, test]
@@ -78,6 +83,7 @@ jobs:
         if: matrix.target != 'universal-apple-darwin'
       - uses: Swatinem/rust-cache@v2
         with:
+          workspaces: src-tauri
           key: ${{ matrix.target }}
       - uses: actions/setup-node@v4
         with:
