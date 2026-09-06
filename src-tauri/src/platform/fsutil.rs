@@ -47,14 +47,8 @@ pub fn rename_no_replace_impl(from: &Path, to: &Path) -> io::Result<()> {
     let c_to = CString::new(to.as_os_str().as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "路径包含 NUL 字节"))?;
 
-    let ret = unsafe {
-        libc::renamex_np(
-            c_from.as_ptr(),
-            c_to.as_ptr(),
-            std::ptr::null(),
-            libc::RENAME_EXCL,
-        )
-    };
+    // Apple 平台的 renamex_np 签名为 (from, to, flags),无 attrlist 参数
+    let ret = unsafe { libc::renamex_np(c_from.as_ptr(), c_to.as_ptr(), libc::RENAME_EXCL) };
     if ret == 0 {
         return Ok(());
     }
